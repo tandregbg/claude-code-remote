@@ -45,6 +45,7 @@ PORT_BASE=44000
 SSH_PORT=5544
 CLAUDE_FLAGS="--dangerously-skip-permissions"
 RELAY_SCRIPT="workspace/scripts/tunnel-relay.sh"
+VM_INVENTORY=""
 
 # Load config
 if [ -f "$CONFIG" ]; then
@@ -62,6 +63,7 @@ if [ -f "$CONFIG" ]; then
             vm_port_base)   PORT_BASE="$value" ;;
             vm_ssh_port)    SSH_PORT="$value" ;;
             claude_flags)   CLAUDE_FLAGS="$value" ;;
+            vm_inventory)   VM_INVENTORY="$value" ;;
         esac
     done < "$CONFIG"
 fi
@@ -264,7 +266,7 @@ LOCALEOF
 
     if [ "$ROLE" = "relay" ]; then
         # Direct connection to VM IP -- no tunnel needed from Mac Studio
-        local inventory="$HOME/workspace/Tomas/_infrastructure/vm-inventory.yaml"
+        local inventory="${VM_INVENTORY:-$HOME/vm-inventory.yaml}"
         local vm_ip="" vm_port="" vm_user="" vm_auth=""
         if [ -f "$inventory" ] && command -v yq >/dev/null 2>&1; then
             vm_ip=$(yq ".vms.${vm}.ip" "$inventory" 2>/dev/null)

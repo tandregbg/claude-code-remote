@@ -20,9 +20,9 @@ Laptop (role=remote)
 Hub machine (role=relay)
   |
   tmux session "ccr-hub"
-  ├── window "hej-barbro"    → ssh 192.168.44.16:5544   → claude in tmux
-  ├── window "sonetel-api"   → ssh 192.168.44.146:5544  → claude in tmux
-  ├── window "ops"           → local shell               → claude
+  ├── window "project-a"     → ssh <vm-ip>:<port>    → claude in tmux
+  ├── window "project-b"     → ssh <vm-ip>:<port>    → claude in tmux
+  ├── window "ops"           → local shell            → claude
   └── ...
 ```
 
@@ -35,13 +35,13 @@ Hub machine (role=relay)
 
 ### Connection layers
 
-When on the hub machine, ccr connects **directly** to VM IPs (e.g. `192.168.44.x:5544`). No tunnel relay needed.
+When on the hub machine, ccr connects **directly** to VM IPs. No tunnel relay needed.
 
 When on a remote machine, ccr SSHes to the hub and runs commands there via ProxyJump.
 
 ## Installation
 
-### Hub machine (Mac Studio, server, etc.)
+### Hub machine
 
 ```bash
 # 1. Place the script
@@ -52,8 +52,8 @@ chmod +x ~/bin/ccr
 # 2. Create config
 cat > ~/.ccr << 'EOF'
 role=relay
-vm_user=ubuntu
-vm_password=ubuntu
+vm_user=<default-ssh-user>
+vm_password=<default-ssh-password>
 vm_dir=~/src
 vm_port_base=44000
 vm_ssh_port=5544
@@ -75,9 +75,9 @@ chmod +x ~/bin/ccr
 cat > ~/.ccr << 'EOF'
 role=remote
 relay_host=user@hub-machine
-relay_host_fallback=user@100.x.x.x   # Tailscale IP (optional)
-vm_user=ubuntu
-vm_password=ubuntu
+relay_host_fallback=user@<tailscale-ip>   # optional
+vm_user=<default-ssh-user>
+vm_password=<default-ssh-password>
 vm_dir=~/src
 vm_port_base=44000
 vm_ssh_port=5544
@@ -90,29 +90,25 @@ brew install sshpass
 
 ### VM inventory
 
-The hub reads VM IPs from a YAML inventory file. Default location:
-
-```
-~/workspace/Tomas/_infrastructure/vm-inventory.yaml
-```
+The hub reads VM IPs from a YAML inventory file. Configure the path in the script or use the default location.
 
 Format:
 
 ```yaml
 defaults:
-  user: ubuntu
+  user: <ssh-user>
   auth: password
-  password: ubuntu
+  password: <ssh-password>
   port: 5544
 
 vms:
-  mindtastic:
-    ip: 192.168.44.145
-  heybarbro:
-    ip: 192.168.44.16
-  doable:
-    ip: 192.168.44.100
-    user: tomas
+  my-dev-vm:
+    ip: 10.0.1.100
+  my-web-vm:
+    ip: 10.0.1.101
+  special-vm:
+    ip: 10.0.1.200
+    user: admin
     port: 22
     auth: key
 ```
@@ -161,13 +157,13 @@ ccr hub remove <tag>
 Tags are saved in `~/.ccr-tags` on the hub machine:
 
 ```
-# tag          vm          directory                    mode
-hej-barbro     heybarbro   /home/ubuntu/hej_barbro      claude
-ops            local       ~/workspace                  shell
-goals          local       /path/to/goals               claude
+# tag          vm          directory              mode
+project-a      my-dev-vm   ~/src/project-a        claude
+ops            local       ~/workspace            shell
+goals          local       ~/documents/goals      claude
 ```
 
-- **mode `claude`** (default): starts Claude Code with `--dangerously-skip-permissions`
+- **mode `claude`** (default): starts Claude Code with configured flags
 - **mode `shell`**: opens a plain shell
 
 Tags persist across reboots. When `ccr hub` creates a new hub session, it auto-restores all saved tags.
@@ -204,7 +200,7 @@ Windows have a retry loop -- they show the error and reconnect automatically eve
 When `relay_host_fallback` is set in `~/.ccr`, the script automatically tries the fallback if the primary host is unreachable:
 
 ```
-(primary unreachable, using Tailscale: tomas@100.97.9.10)
+(primary unreachable, using Tailscale: user@<fallback-ip>)
 ```
 
 No manual intervention needed.
@@ -219,7 +215,7 @@ From a laptop, switch between hubs by specifying the host:
 # Default hub
 ccr hub
 
-# Different hub (future: --host flag)
+# Different hub
 ssh user@other-hub "ccr hub"
 ```
 
@@ -243,8 +239,8 @@ ssh user@other-hub "ccr hub"
 | `role` | `relay` | `relay` (hub) or `remote` (laptop) |
 | `relay_host` | | SSH target for remote role (e.g. `user@host`) |
 | `relay_host_fallback` | | Tailscale fallback SSH target |
-| `vm_user` | `ubuntu` | Default VM SSH user |
-| `vm_password` | `ubuntu` | Default VM SSH password |
+| `vm_user` | | Default VM SSH user |
+| `vm_password` | | Default VM SSH password |
 | `vm_dir` | `~/src` | Default working directory on VMs |
 | `vm_port_base` | `44000` | Base port for tunnel mapping |
 | `vm_ssh_port` | `5544` | Default VM SSH port |
