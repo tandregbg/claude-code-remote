@@ -1,0 +1,860 @@
+#!/bin/bash
+# ccr - Claude Code Remote via tunnel relay
+# Config: ~/.ccr (role, relay host, VM defaults)
+#
+# Usage:
+#   ccr                           # List VMs with tunnel status
+#   ccr <vm>                      # Start Claude Code session
+#   ccr <vm> -c                   # Continue last session on VM
+#   ccr <vm> -n "my-task"         # Named session
+#   ccr <vm> -p "prompt"          # One-shot print mode
+#   ccr <vm> -- <any claude args> # Pass arbitrary args to claude
+#
+# Hub mode (session persistence across disconnects):
+#   ccr hub                       # Attach to hub (or create empty)
+#   ccr hub <tag>                 # Open saved tag in hub
+#   ccr hub add <vm>              # Add VM interactively (discover dirs, pick tag)
+#   ccr hub add <vm> -t tag -d /path  # Add VM with explicit tag and dir
+#   ccr hub add local             # Add a Mac Studio shell session
+#   ccr hub add local -t ops -d ~/Projects/my-project
+#   ccr hub list                  # Show hub windows and registered tags
+#   ccr hub refresh               # Reconnect dead windows
+#   ccr hub remove <tag>          # Remove a saved tag
+#
+# Roles:
+#   relay  — runs on the tmux host (Mac Studio), connects directly to tunnels
+#   remote — runs on laptop/other, hops through relay host via ProxyJump
+#
+# Only needs two files on any machine: ~/bin/ccr + ~/.ccr
+
+set -euo pipefail
+
+# Ensure homebrew and ~/bin are in PATH (non-interactive SSH has minimal PATH)
+export PATH="$HOME/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+CONFIG="$HOME/.ccr"
+
+# Defaults (overridden by ~/.ccr)
+ROLE="relay"
+RELAY_HOST=""
+RELAY_HOST_FALLBACK=""
+VM_USER="ubuntu"
+VM_PASSWORD="ubuntu"
+VM_DIR="~/src"
+PORT_BASE=44000
+SSH_PORT=5544
+CLAUDE_FLAGS="--dangerously-skip-permissions"
+RELAY_SCRIPT="workspace/scripts/tunnel-relay.sh"
+
+# Load config
+if [ -f "$CONFIG" ]; then
+    while IFS='=' read -r key value; do
+        [[ "$key" =~ ^#.*$ || -z "$key" ]] && continue
+        key=$(echo "$key" | xargs)
+        value=$(echo "$value" | xargs)
+        case "$key" in
+            role)           ROLE="$value" ;;
+            relay_host)     RELAY_HOST="$value" ;;
+            relay_host_fallback) RELAY_HOST_FALLBACK="$value" ;;
+            vm_user)        VM_USER="$value" ;;
+            vm_password)    VM_PASSWORD="$value" ;;
+            vm_dir)         VM_DIR="$value" ;;
+            vm_port_base)   PORT_BASE="$value" ;;
+            vm_ssh_port)    SSH_PORT="$value" ;;
+            claude_flags)   CLAUDE_FLAGS="$value" ;;
+        esac
+    done < "$CONFIG"
+fi
+
+# Validate remote config
+if [ "$ROLE" = "remote" ] && [ -z "$RELAY_HOST" ]; then
+    echo "Error: role=remote but relay_host not set in ~/.ccr"
+    exit 1
+fi
+
+# Resolve reachable relay host with Tailscale fallback.
+# Only probes when primary fails -- no overhead on the happy path.
+_RELAY_RESOLVED=false
+resolve_relay() {
+    [ "$_RELAY_RESOLVED" = true ] && return
+    _RELAY_RESOLVED=true
+    if [ "$ROLE" != "remote" ] || [ -z "$RELAY_HOST_FALLBACK" ]; then return; fi
+
+    # Quick check: can we reach the primary? (2s timeout)
+    if ! ssh -o ConnectTimeout=2 -o BatchMode=yes "$RELAY_HOST" true 2>/dev/null; then
+        if ssh -o ConnectTimeout=3 -o BatchMode=yes "$RELAY_HOST_FALLBACK" true 2>/dev/null; then
+            echo "(primary unreachable, using Tailscale: $RELAY_HOST_FALLBACK)" >&2
+            RELAY_HOST="$RELAY_HOST_FALLBACK"
+        else
+            echo "Error: Cannot reach relay ($RELAY_HOST or $RELAY_HOST_FALLBACK)" >&2
+            exit 1
+        fi
+    fi
+}
+
+# Find tunnel-relay.sh (local)
+find_relay_script() {
+    for path in "$HOME/$RELAY_SCRIPT" "/Users/tomas/$RELAY_SCRIPT"; do
+        [ -f "$path" ] && echo "$path" && return
+    done
+}
+
+# Get VM list + status
+get_vms() {
+    if [ "$ROLE" = "relay" ]; then
+        local script
+        script=$(find_relay_script)
+        if [ -n "$script" ]; then
+            "$script" status 2>/dev/null
+            return
+        fi
+    fi
+
+    # Remote: fetch status from relay host
+    if [ "$ROLE" = "remote" ] && [ -n "$RELAY_HOST" ]; then
+        echo "Fetching VM status from $RELAY_HOST..."
+        echo ""
+        ssh -o ConnectTimeout=5 "$RELAY_HOST" "$RELAY_SCRIPT status" 2>/dev/null && return
+        echo "(relay unreachable, showing cached ports)"
+        echo ""
+    fi
+
+    # Fallback: parse local SSH config
+    awk '/^Host relay_[^*]/{name=$2; sub(/^relay_/,"",name); getline; getline; port=$2; printf "  %-18s localhost:%s\n", name, port}' ~/.ssh/config 2>/dev/null
+}
+
+# Resolve host port
+resolve_port() {
+    local host="$1"
+
+    # 1. Try local SSH config
+    local port
+    port=$(awk -v host="Host relay_${host}" '$0 == host {found=1; next} found && /Port /{print $2; exit}' ~/.ssh/config 2>/dev/null)
+    [ -n "$port" ] && echo "$port" && return
+
+    # 2. Try local tunnel-relay.sh
+    if [ "$ROLE" = "relay" ]; then
+        local script
+        script=$(find_relay_script)
+        if [ -n "$script" ]; then
+            port=$("$script" port "$host" 2>/dev/null)
+            [ -n "$port" ] && echo "$port" && return
+        fi
+    fi
+
+    # 3. Remote: ask relay host for the port
+    if [ "$ROLE" = "remote" ] && [ -n "$RELAY_HOST" ]; then
+        port=$(ssh -o ConnectTimeout=5 "$RELAY_HOST" "$RELAY_SCRIPT port $host" 2>/dev/null)
+        [ -n "$port" ] && echo "$port" && return
+    fi
+}
+
+# Resolve host auth method and user from SSH config or relay
+resolve_host_auth() {
+    local host="$1"
+
+    # Check SSH config for User on relay_<host>
+    local user
+    user=$(awk -v h="Host relay_${host}" '$0 == h {found=1; next} found && /User /{print $2; exit}' ~/.ssh/config 2>/dev/null)
+
+    if [ -n "$user" ] && [ "$user" != "ubuntu" ]; then
+        # Non-default user = likely key auth (Tailscale host)
+        echo "key:${user}"
+    elif [ -n "$user" ]; then
+        echo "password:${user}"
+    else
+        # Ask relay
+        if [ "$ROLE" = "relay" ]; then
+            local script
+            script=$(find_relay_script)
+            if [ -n "$script" ]; then
+                : # relay fallback, just use defaults
+            fi
+        fi
+        echo "password:${VM_USER}"
+    fi
+}
+
+HUB_SESSION="ccr-hub"
+HUB_TAGS="$HOME/.ccr-tags"
+
+# Color palette for hub windows (tmux color names)
+HUB_COLORS=(green yellow blue magenta cyan red white)
+
+# --- Tag registry ---
+# Format: tag<TAB>vm<TAB>directory
+# Example: hej-barbro	heybarbro	/hej_barbro
+
+tag_lookup() {
+    local tag="$1"
+    [ -f "$HUB_TAGS" ] || return 1
+    grep -m1 "^${tag}	" "$HUB_TAGS" 2>/dev/null
+}
+
+tag_save() {
+    local tag="$1" vm="$2" dir="$3" mode="${4:-claude}"
+    touch "$HUB_TAGS"
+    # Remove existing entry for this tag
+    if grep -q "^${tag}	" "$HUB_TAGS" 2>/dev/null; then
+        sed -i '' "/^${tag}	/d" "$HUB_TAGS"
+    fi
+    echo -e "${tag}\t${vm}\t${dir}\t${mode}" >> "$HUB_TAGS"
+}
+
+tag_list() {
+    if [ ! -f "$HUB_TAGS" ] || [ ! -s "$HUB_TAGS" ]; then
+        echo "No tags registered. Use 'ccr hub add <vm>' to add one."
+        return
+    fi
+    echo "Registered tags:"
+    printf "  %-20s %-18s %-30s %s\n" "TAG" "VM" "DIRECTORY" "MODE"
+    printf "  %-20s %-18s %-30s %s\n" "---" "--" "---------" "----"
+    while IFS=$'\t' read -r tag vm dir mode; do
+        mode="${mode:-claude}"
+        printf "  %-20s %-18s %-30s %s\n" "$tag" "$vm" "$dir" "$mode"
+    done < "$HUB_TAGS"
+}
+
+tag_remove() {
+    local tag="$1"
+    if [ -f "$HUB_TAGS" ] && grep -q "^${tag}	" "$HUB_TAGS" 2>/dev/null; then
+        sed -i '' "/^${tag}	/d" "$HUB_TAGS"
+        echo "Removed tag '$tag'."
+    else
+        echo "Tag '$tag' not found."
+    fi
+}
+
+# --- SSH command builder ---
+# Build a launcher script for a hub window. Avoids nested quoting hell by
+# writing a small executable script to ~/.ccr-run/<tag>.sh
+# vm="local" means a local shell on Mac Studio, no SSH
+hub_vm_ssh_cmd() {
+    local vm="$1"
+    local dir="${2:-$VM_DIR}"
+    local session_name="${3:-claude}"
+    local tag="${4:-$vm}"
+
+    local run_dir="$HOME/.ccr-run"
+    mkdir -p "$run_dir"
+    local script="${run_dir}/${tag}.sh"
+
+    if [ "$vm" = "local" ]; then
+        local mode="${5:-claude}"
+        if [ "$mode" = "shell" ]; then
+            cat > "$script" << LOCALEOF
+#!/bin/bash
+cd "${dir}" && exec \$SHELL -l
+LOCALEOF
+        else
+            cat > "$script" << LOCALEOF
+#!/bin/bash
+export PATH="\$HOME/bin:/opt/homebrew/bin:/usr/local/bin:\$PATH"
+cd "${dir}" && exec claude ${CLAUDE_FLAGS}
+LOCALEOF
+        fi
+        chmod +x "$script"
+        echo "$script"
+        return
+    fi
+
+    # Resolve connection: direct IP when on relay (Mac Studio), tunnel port when remote
+    local ssh_host ssh_port
+    local auth method user
+
+    if [ "$ROLE" = "relay" ]; then
+        # Direct connection to VM IP -- no tunnel needed from Mac Studio
+        local inventory="$HOME/workspace/Tomas/_infrastructure/vm-inventory.yaml"
+        local vm_ip="" vm_port="" vm_user="" vm_auth=""
+        if [ -f "$inventory" ] && command -v yq >/dev/null 2>&1; then
+            vm_ip=$(yq ".vms.${vm}.ip" "$inventory" 2>/dev/null)
+            [ "$vm_ip" = "null" ] && vm_ip=""
+            vm_port=$(yq ".vms.${vm}.port" "$inventory" 2>/dev/null)
+            [ "$vm_port" = "null" ] && vm_port=""
+            vm_user=$(yq ".vms.${vm}.user" "$inventory" 2>/dev/null)
+            [ "$vm_user" = "null" ] && vm_user=""
+            vm_auth=$(yq ".vms.${vm}.auth" "$inventory" 2>/dev/null)
+            [ "$vm_auth" = "null" ] && vm_auth=""
+        fi
+        if [ -n "$vm_ip" ]; then
+            ssh_host="$vm_ip"
+            ssh_port="${vm_port:-$SSH_PORT}"
+        else
+            ssh_port=$(resolve_port "$vm")
+            ssh_host="localhost"
+        fi
+    else
+        ssh_port=$(resolve_port "$vm")
+        ssh_host="localhost"
+    fi
+    [ -z "$ssh_port" ] && return 1
+
+    # Use per-VM overrides from inventory if available, else resolve from SSH config
+    if [ -n "$vm_user" ]; then
+        user="$vm_user"
+        method="${vm_auth:-password}"
+    else
+        auth=$(resolve_host_auth "$vm")
+        method="${auth%%:*}"
+        user="${auth##*:}"
+    fi
+
+    local ssh_bin="/usr/bin/ssh"
+    local sshpass_bin
+    sshpass_bin=$(command -v sshpass 2>/dev/null || echo "/opt/homebrew/bin/sshpass")
+
+    local tmux_session="ccr-${session_name}"
+
+    # Write launcher script.
+    # The tmux command on the VM uses single quotes for the shell command
+    # passed to new-session, which works because SSH passes it as one arg.
+    cat > "$script" << 'SCRIPTEOF'
+#!/bin/bash
+export PATH="$HOME/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+unset TMUX
+SSH_OPTS="-tt -o StrictHostKeyChecking=no -o ServerAliveInterval=15 -o ServerAliveCountMax=6 -o TCPKeepAlive=yes"
+INNER='cd __DIR__ && export PATH=$HOME/.npm-global/bin:$HOME/.local/bin:$PATH && claude __FLAGS__'
+REMOTE="if tmux has-session -t __TMUX_SESSION__ 2>/dev/null; then tmux attach -t __TMUX_SESSION__; else tmux new-session -s __TMUX_SESSION__ '$INNER'; fi"
+
+# Retry loop -- keeps window alive on failure so it can be diagnosed/refreshed
+while true; do
+    __SSH_CMD__ $SSH_OPTS -p __PORT__ __USER__@__HOST__ "$REMOTE"
+    EXIT_CODE=$?
+    echo ""
+    echo "[ccr] Connection lost (exit $EXIT_CODE). Retrying in 10s... (Ctrl+C to stop)"
+    sleep 10
+done
+SCRIPTEOF
+
+    sed -i '' \
+        -e "s|__TMUX_SESSION__|${tmux_session}|g" \
+        -e "s|__DIR__|${dir}|g" \
+        -e "s|__FLAGS__|${CLAUDE_FLAGS}|g" \
+        -e "s|__PORT__|${ssh_port}|g" \
+        -e "s|__HOST__|${ssh_host}|g" \
+        -e "s|__USER__|${user}|g" \
+        "$script"
+
+    if [ "$method" = "key" ]; then
+        sed -i '' "s|__SSH_CMD__|${ssh_bin}|" "$script"
+    else
+        sed -i '' "s|__SSH_CMD__|${sshpass_bin} -p ${VM_PASSWORD} ${ssh_bin}|" "$script"
+    fi
+
+    chmod +x "$script"
+    echo "$script"
+}
+
+# --- Hub management ---
+# All hub_* functions assume role=relay (running on Mac Studio)
+
+hub_apply_style() {
+    # Color-coded status bar with all windows visible
+    tmux set-option -t "$HUB_SESSION" status on 2>/dev/null
+    tmux set-option -t "$HUB_SESSION" status-style "bg=black,fg=white" 2>/dev/null
+    tmux set-option -t "$HUB_SESSION" status-left "#[bg=blue,fg=white,bold] HUB " 2>/dev/null
+    tmux set-option -t "$HUB_SESSION" status-left-length 20 2>/dev/null
+    tmux set-option -t "$HUB_SESSION" status-right "#[fg=white] %H:%M " 2>/dev/null
+    tmux set-option -t "$HUB_SESSION" mouse on 2>/dev/null
+
+    # Color each window based on its index
+    local i=0
+    while IFS=$'\t' read -r win_idx win_name; do
+        local color="${HUB_COLORS[$((i % ${#HUB_COLORS[@]}))]}"
+        tmux set-window-option -t "${HUB_SESSION}:${win_idx}" window-status-format \
+            " #[fg=${color}]#I:#W " 2>/dev/null
+        tmux set-window-option -t "${HUB_SESSION}:${win_idx}" window-status-current-format \
+            "#[bg=${color},fg=black,bold] #I:#W " 2>/dev/null
+        i=$((i + 1))
+    done < <(tmux list-windows -t "$HUB_SESSION" -F '#{window_index}	#W' 2>/dev/null)
+}
+
+hub_ensure() {
+    if ! tmux has-session -t "$HUB_SESSION" 2>/dev/null; then
+        tmux new-session -d -s "$HUB_SESSION" -n "hub"
+        tmux send-keys -t "${HUB_SESSION}:hub" "echo 'ccr hub -- Ctrl+b,w to list windows | ccr hub add <vm> to add'" Enter
+
+        # Auto-restore: open all saved tags as windows
+        if [ -f "$HUB_TAGS" ] && [ -s "$HUB_TAGS" ]; then
+            local restored=0
+            while IFS=$'\t' read -r tag vm dir mode; do
+                [ -z "$tag" ] && continue
+                mode="${mode:-claude}"
+                local cmd
+                cmd=$(hub_vm_ssh_cmd "$vm" "$dir" "claude" "$tag" "$mode")
+                if [ -n "$cmd" ]; then
+                    tmux new-window -t "$HUB_SESSION" -n "$tag" "$cmd"
+                    restored=$((restored + 1))
+                    # Stagger window creation to avoid overwhelming tunnels
+                    sleep 2
+                fi
+            done < "$HUB_TAGS"
+            if [ "$restored" -gt 0 ]; then
+                tmux send-keys -t "${HUB_SESSION}:hub" "echo 'Restored $restored session(s) from saved tags.'" Enter
+            fi
+        fi
+
+        hub_apply_style
+    fi
+}
+
+hub_open_tag() {
+    local tag="$1"
+    local entry
+    entry=$(tag_lookup "$tag")
+    if [ -z "$entry" ]; then
+        echo "Tag '$tag' not found. Use 'ccr hub add <vm>' or 'ccr hub tags' to see registered tags."
+        return 1
+    fi
+
+    local vm dir mode
+    vm=$(echo "$entry" | cut -f2)
+    dir=$(echo "$entry" | cut -f3)
+    mode=$(echo "$entry" | cut -f4)
+    mode="${mode:-claude}"
+
+    hub_ensure
+
+    # Check if window already exists for this tag
+    if tmux list-windows -t "$HUB_SESSION" -F '#W' 2>/dev/null | grep -qx "$tag"; then
+        echo "Window '$tag' already exists. Switching..."
+        tmux select-window -t "${HUB_SESSION}:${tag}"
+        tmux attach -t "$HUB_SESSION"
+        return
+    fi
+
+    local cmd
+    cmd=$(hub_vm_ssh_cmd "$vm" "$dir" "claude" "$tag" "$mode")
+    if [ -z "$cmd" ]; then
+        echo "Error: Cannot resolve VM '$vm' for tag '$tag'"
+        return 1
+    fi
+
+    tmux new-window -t "$HUB_SESSION" -n "$tag" "$cmd"
+    tmux select-window -t "${HUB_SESSION}:${tag}"
+    hub_apply_style
+    tmux attach -t "$HUB_SESSION"
+}
+
+hub_add_interactive() {
+    local vm="$1"
+    local explicit_tag="${2:-}"
+    local explicit_dir="${3:-}"
+    local explicit_mode="${4:-}"
+    local is_local=false
+
+    # "local" means a shell on Mac Studio itself
+    if [ "$vm" = "local" ]; then
+        is_local=true
+    else
+        # Verify VM exists
+        local port
+        port=$(resolve_port "$vm")
+        if [ -z "$port" ]; then
+            echo "Error: Unknown VM '$vm'"
+            return 1
+        fi
+    fi
+
+    local auth method user
+    if [ "$is_local" = false ]; then
+        auth=$(resolve_host_auth "$vm")
+        method="${auth%%:*}"
+        user="${auth##*:}"
+    fi
+
+    local dir="$explicit_dir"
+
+    if [ -z "$dir" ]; then
+        if [ "$is_local" = true ]; then
+            # Discover directories on Mac Studio
+            echo "Discovering project directories on Mac Studio..."
+            local dirs
+            dirs=$(find ~/Projects ~/repos ~/workspace -maxdepth 2 -name '.git' -o -name 'package.json' -o -name 'CLAUDE.md' -o -name 'pyproject.toml' -o -name 'Cargo.toml' 2>/dev/null | sed 's|/[^/]*$||' | sort -u | head -20)
+        else
+            # Discover directories on the VM
+            echo "Discovering project directories on $vm..."
+            local ssh_bin="/usr/bin/ssh"
+            local ssh_opts="-o StrictHostKeyChecking=no -o ConnectTimeout=10"
+            local discover_cmd="find ~ -maxdepth 3 -name '.git' -o -name 'package.json' -o -name 'CLAUDE.md' -o -name 'pyproject.toml' -o -name 'Cargo.toml' 2>/dev/null | sed 's|/[^/]*$||' | sort -u | head -20"
+
+            local dirs=""
+            if [ "$method" = "key" ]; then
+                dirs=$($ssh_bin $ssh_opts -p "$port" "${user}@localhost" "$discover_cmd" 2>/dev/null)
+            else
+                dirs=$(sshpass -p "${VM_PASSWORD}" $ssh_bin $ssh_opts -p "$port" "${user}@localhost" "$discover_cmd" 2>/dev/null)
+            fi
+        fi
+
+        local default_dir="$VM_DIR"
+        [ "$is_local" = true ] && default_dir="$HOME"
+
+        if [ -z "$dirs" ]; then
+            echo "No project directories found. Using default: $default_dir"
+            dir="$default_dir"
+        else
+            echo ""
+            echo "Found project directories:"
+            local i=1
+            local dir_array=()
+            while IFS= read -r d; do
+                dir_array+=("$d")
+                printf "  %2d) %s\n" "$i" "$d"
+                i=$((i + 1))
+            done <<< "$dirs"
+            # Add default option
+            dir_array+=("$default_dir")
+            printf "  %2d) %s (default)\n" "$i" "$default_dir"
+
+            echo ""
+            read -rp "Select directory [1-$i]: " choice
+            if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#dir_array[@]}" ]; then
+                dir="${dir_array[$((choice - 1))]}"
+            else
+                dir="$default_dir"
+            fi
+        fi
+    fi
+
+    # Ask for tag name
+    local tag="$explicit_tag"
+    if [ -z "$tag" ]; then
+        local default_tag="$vm"
+        # Suggest a tag from the directory name
+        local dirname
+        dirname=$(basename "$dir")
+        if [ "$dirname" != "src" ] && [ "$dirname" != "~" ]; then
+            default_tag="$dirname"
+        fi
+        echo ""
+        read -rp "Tag name [$default_tag]: " tag
+        tag="${tag:-$default_tag}"
+    fi
+
+    # Sanitize tag (no spaces, lowercase)
+    tag=$(echo "$tag" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr -cd 'a-z0-9_-')
+
+    # Ask for mode if not set (local only)
+    local mode="${explicit_mode:-claude}"
+    if [ "$is_local" = true ] && [ -z "$explicit_mode" ]; then
+        echo ""
+        read -rp "Mode - claude or shell? [claude]: " mode
+        mode="${mode:-claude}"
+    fi
+
+    # Save to registry
+    tag_save "$tag" "$vm" "$dir" "$mode"
+    echo ""
+    echo "Saved: $tag -> $vm:$dir ($mode)"
+
+    # Open in hub
+    hub_open_tag "$tag"
+}
+
+hub_list() {
+    if ! tmux has-session -t "$HUB_SESSION" 2>/dev/null; then
+        echo "No hub session running."
+        echo ""
+        tag_list
+        return
+    fi
+    echo "Hub windows:"
+    local i=0
+    while IFS=$'\t' read -r win_idx win_name pane_cmd pane_dead; do
+        local color="${HUB_COLORS[$((i % ${#HUB_COLORS[@]}))]}"
+        local status="alive"
+        [ "$pane_dead" = "1" ] && status="DEAD"
+        # Look up tag info
+        local entry
+        entry=$(tag_lookup "$win_name" 2>/dev/null)
+        local detail=""
+        if [ -n "$entry" ]; then
+            local tag_vm tag_dir
+            tag_vm=$(echo "$entry" | cut -f2)
+            tag_dir=$(echo "$entry" | cut -f3)
+            detail=" ($tag_vm:$tag_dir)"
+        fi
+        printf "  \033[1;3%dm%d: %-20s\033[0m %s%s\n" "$((i % 7 + 1))" "$win_idx" "$win_name" "$status" "$detail"
+        i=$((i + 1))
+    done < <(tmux list-windows -t "$HUB_SESSION" -F '#{window_index}	#W	#{pane_current_command}	#{pane_dead}' 2>/dev/null)
+    echo ""
+    tag_list
+}
+
+hub_refresh() {
+    if ! tmux has-session -t "$HUB_SESSION" 2>/dev/null; then
+        echo "No hub session running."
+        return 1
+    fi
+
+    local refreshed=0
+    while IFS=$'\t' read -r win_idx win_name pane_dead pane_pid; do
+        [ "$win_name" = "hub" ] && continue
+
+        if [ "$pane_dead" = "1" ] || ! kill -0 "$pane_pid" 2>/dev/null; then
+            # Try to find tag info for correct directory
+            local entry dir cmd
+            entry=$(tag_lookup "$win_name" 2>/dev/null)
+            if [ -n "$entry" ]; then
+                local tag_vm
+                tag_vm=$(echo "$entry" | cut -f2)
+                dir=$(echo "$entry" | cut -f3)
+                cmd=$(hub_vm_ssh_cmd "$tag_vm" "$dir" "claude" "$win_name")
+            else
+                cmd=$(hub_vm_ssh_cmd "$win_name" "$VM_DIR" "claude" "$win_name")
+            fi
+            if [ -n "$cmd" ]; then
+                echo "Refreshing: $win_name (window $win_idx)"
+                tmux respawn-pane -t "${HUB_SESSION}:${win_idx}" -k "$cmd"
+                refreshed=$((refreshed + 1))
+            fi
+        fi
+    done < <(tmux list-windows -t "$HUB_SESSION" -F '#{window_index}	#W	#{pane_dead}	#{pane_pid}' 2>/dev/null)
+
+    if [ "$refreshed" -eq 0 ]; then
+        echo "All hub windows alive."
+    else
+        echo "Refreshed $refreshed window(s)."
+        hub_apply_style
+    fi
+}
+
+# Resolve relay before any command that needs it
+resolve_relay
+
+# Handle 'ccr hub' command
+if [ "${1:-}" = "hub" ]; then
+    shift
+    subcmd="${1:-attach}"
+
+    # Recognized subcommands
+    case "$subcmd" in
+        list|tags|refresh|attach|add|remove) shift 2>/dev/null || true ;;
+        *)
+            # Could be a tag name -- check if it exists, else treat as add
+            if [ "$ROLE" = "relay" ] && tag_lookup "$subcmd" >/dev/null 2>&1; then
+                # It's a known tag
+                subcmd_arg="$subcmd"
+                subcmd="open"
+            else
+                # Unknown -- pass through to relay to check there
+                subcmd_arg="$subcmd"
+                subcmd="open"
+            fi
+            shift 2>/dev/null || true
+            ;;
+    esac
+
+    if [ "$ROLE" = "remote" ]; then
+        # Remote: SSH to Mac Studio and run ccr hub there
+        REMOTE_CCR="\$HOME/bin/ccr"
+        SSH_RELAY_OPTS="-o ServerAliveInterval=15 -o ServerAliveCountMax=6 -o TCPKeepAlive=yes"
+        case "$subcmd" in
+            list|tags)
+                ssh -o ConnectTimeout=5 "$RELAY_HOST" "$REMOTE_CCR hub list"
+                ;;
+            refresh)
+                ssh -o ConnectTimeout=5 "$RELAY_HOST" "$REMOTE_CCR hub refresh"
+                ;;
+            remove)
+                ssh -o ConnectTimeout=5 "$RELAY_HOST" "$REMOTE_CCR hub remove $1"
+                ;;
+            attach)
+                exec ssh -tt $SSH_RELAY_OPTS "$RELAY_HOST" "$REMOTE_CCR hub"
+                ;;
+            add)
+                # add is interactive -- needs terminal
+                local_vm="$1"; shift 2>/dev/null || true
+                local_flags=""
+                while [ $# -gt 0 ]; do
+                    case "$1" in
+                        -t) local_flags="$local_flags -t $2"; shift 2 ;;
+                        -d)
+                            # Convert expanded ~ back to ~/  so the path
+                            # is correct on Mac Studio, not the local machine
+                            dir_arg="$2"
+                            dir_arg="${dir_arg/#$HOME/\~}"
+                            local_flags="$local_flags -d $dir_arg"
+                            shift 2 ;;
+                        -m) local_flags="$local_flags -m $2"; shift 2 ;;
+                        *) shift ;;
+                    esac
+                done
+                exec ssh -tt $SSH_RELAY_OPTS "$RELAY_HOST" "$REMOTE_CCR hub add $local_vm $local_flags"
+                ;;
+            open)
+                exec ssh -tt $SSH_RELAY_OPTS "$RELAY_HOST" "$REMOTE_CCR hub ${subcmd_arg}"
+                ;;
+        esac
+        exit 0
+    fi
+
+    # Role=relay: run locally on Mac Studio
+    case "$subcmd" in
+        list|tags) hub_list ;;
+        refresh)   hub_refresh ;;
+        remove)    tag_remove "$1" ;;
+        attach)
+            hub_ensure
+            exec tmux attach -t "$HUB_SESSION"
+            ;;
+        add)
+            # Parse -t tag -d dir flags
+            local_vm="$1"; shift 2>/dev/null || true
+            add_tag="" ; add_dir=""
+            add_mode=""
+            while [ $# -gt 0 ]; do
+                case "$1" in
+                    -t) add_tag="$2"; shift 2 ;;
+                    -d) add_dir="$2"; shift 2 ;;
+                    -m) add_mode="$2"; shift 2 ;;
+                    *) shift ;;
+                esac
+            done
+            hub_add_interactive "$local_vm" "$add_tag" "$add_dir" "$add_mode"
+            ;;
+        open)
+            hub_open_tag "${subcmd_arg}"
+            ;;
+    esac
+    exit 0
+fi
+
+# No args: show available hosts with active sessions first
+if [ -z "${1:-}" ]; then
+    echo "ccr - Claude Code Remote (role: $ROLE)"
+    [ "$ROLE" = "remote" ] && echo "relay: $RELAY_HOST"
+    echo ""
+
+    # Fetch active sessions first
+    _sessions=""
+    if [ "$ROLE" = "remote" ] && [ -n "$RELAY_HOST" ]; then
+        _sessions=$(ssh -o ConnectTimeout=5 "$RELAY_HOST" "$RELAY_SCRIPT sessions" 2>/dev/null)
+    elif [ "$ROLE" = "relay" ]; then
+        _script=$(find_relay_script)
+        [ -n "$_script" ] && _sessions=$("$_script" sessions 2>/dev/null)
+    fi
+
+    # Active sessions at the top
+    if [ -n "$_sessions" ]; then
+        echo -e "\033[1;32m>>> Active sessions:\033[0m"
+        echo "$_sessions" | while IFS= read -r line; do
+            echo -e "  \033[1;32m${line}\033[0m"
+        done
+        echo ""
+    fi
+
+    echo "Usage: ccr <host> [claude args...]"
+    echo ""
+
+    # Fetch host status, marking hosts with active sessions
+    if [ -n "$_sessions" ]; then
+        # Get list of hosts with sessions
+        _active_hosts=$(echo "$_sessions" | sed 's/:.*//' | sort -u)
+
+        # Fetch status and mark active hosts
+        _status=""
+        if [ "$ROLE" = "remote" ] && [ -n "$RELAY_HOST" ]; then
+            _status=$(ssh -o ConnectTimeout=5 "$RELAY_HOST" "$RELAY_SCRIPT status" 2>/dev/null)
+        elif [ "$ROLE" = "relay" ]; then
+            _script=$(find_relay_script)
+            [ -n "$_script" ] && _status=$("$_script" status 2>/dev/null)
+        fi
+
+        if [ -n "$_status" ]; then
+            echo "$_status" | while IFS= read -r line; do
+                _marked=false
+                for _h in $_active_hosts; do
+                    if echo "$line" | grep -q "^  ${_h} "; then
+                        echo -e "\033[1;32m${line} ◀ session\033[0m"
+                        _marked=true
+                        break
+                    fi
+                done
+                [ "$_marked" = false ] && echo "$line"
+            done
+        fi
+    else
+        get_vms
+    fi
+
+    echo ""
+    echo "Examples:"
+    echo "  ccr mindtastic             # New or reattach"
+    echo "  ccr mindtastic -c          # Reattach only"
+    echo "  ccr mindtastic -n bugfix   # Named session"
+    echo ""
+    echo "Hub (resilient multi-session):"
+    echo "  ccr hub                    # Attach to hub on Mac Studio"
+    echo "  ccr hub add heybarbro      # Add VM (discover dirs, pick tag)"
+    echo "  ccr hub add sonetel -t api -d ~/src/api"
+    echo "  ccr hub add local -t ops   # Mac Studio shell"
+    echo "  ccr hub hej-barbro         # Open saved tag"
+    echo "  ccr hub list               # Show windows and tags"
+    echo "  ccr hub refresh            # Reconnect dead windows"
+    echo "  ccr hub remove <tag>       # Remove a saved tag"
+    exit 0
+fi
+
+VM="$1"
+shift
+
+# Resolve port
+vm_port=$(resolve_port "$VM")
+
+if [ -z "$vm_port" ]; then
+    echo "Error: Unknown VM '${VM}'"
+    echo ""
+    echo "Run 'ccr' with no args to see available VMs."
+    exit 1
+fi
+
+# Parse ccr-specific flags before claude args
+SESSION_NAME="claude"
+CONTINUE=false
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -n) SESSION_NAME="$2"; shift 2 ;;
+        -c) CONTINUE=true; shift ;;
+        --) shift; break ;;
+        *)  break ;;
+    esac
+done
+
+CLAUDE_ARGS=""
+if [ $# -gt 0 ]; then
+    CLAUDE_ARGS="$*"
+fi
+
+# Build SSH command with keepalive to prevent disconnects
+SSH_OPTS="-tt -o StrictHostKeyChecking=no -o ServerAliveInterval=15 -o ServerAliveCountMax=6 -o TCPKeepAlive=yes"
+if [ "$ROLE" = "remote" ]; then
+    SSH_OPTS="$SSH_OPTS -o ProxyJump=$RELAY_HOST"
+fi
+
+# Wrap claude in tmux on the VM so sessions persist after disconnect.
+# - First run: creates tmux session and starts claude
+# - Reconnect (-c): attaches to existing session
+# - Detach: Ctrl+b d (keeps claude running on VM)
+TMUX_SESSION="ccr-${SESSION_NAME}"
+CLAUDE_CMD="cd ${VM_DIR} && export PATH=\$HOME/.npm-global/bin:\$HOME/.local/bin:\$PATH && claude ${CLAUDE_FLAGS} ${CLAUDE_ARGS}"
+
+# Always attach to existing session if it exists, otherwise create new
+# -c flag just means "attach only, don't create"
+if [ "$CONTINUE" = true ]; then
+    REMOTE_CMD="tmux attach -t ${TMUX_SESSION} 2>/dev/null || echo 'No session \"${TMUX_SESSION}\" found on ${VM}. Start one with: ccr ${VM}'"
+else
+    # Auto-attach if session exists, with a notice
+    REMOTE_CMD="if tmux has-session -t ${TMUX_SESSION} 2>/dev/null; then echo 'Reattaching to existing session ${TMUX_SESSION}...'; sleep 0.5; tmux attach -t ${TMUX_SESSION}; else tmux new-session -s ${TMUX_SESSION} '${CLAUDE_CMD}'; fi"
+fi
+
+# Resolve auth method for this host
+HOST_AUTH=$(resolve_host_auth "$VM")
+AUTH_METHOD="${HOST_AUTH%%:*}"
+AUTH_USER="${HOST_AUTH##*:}"
+
+if [ "$AUTH_METHOD" = "key" ]; then
+    exec ssh $SSH_OPTS -p "$vm_port" "${AUTH_USER}@localhost" "$REMOTE_CMD"
+else
+    exec sshpass -p "${VM_PASSWORD}" ssh $SSH_OPTS -p "$vm_port" "${AUTH_USER}@localhost" "$REMOTE_CMD"
+fi
