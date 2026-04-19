@@ -1,0 +1,188 @@
+#!/bin/bash
+# ccr-setup - Discover LXC containers and generate vm-inventory.yaml
+#
+# Run on the LXC host (e.g. supermicroubuntu) to:
+# 1. Discover running containers via 'lxc list'
+# 2. Generate or update vm-inventory.yaml
+# 3. Optionally check SSH connectivity and claude installation per VM
+#
+# Usage:
+#   ccr-setup                    # Discover and generate inventory
+#   ccr-setup --check            # Also check SSH + claude on each VM
+#   ccr-setup --output /path     # Write inventory to specific path
+#   ccr-setup --dry-run          # Show what would be generated
+
+set -euo pipefail
+
+# Defaults
+CCR_CONFIG="$HOME/.ccr"
+DEFAULT_USER="ubuntu"
+DEFAULT_PASSWORD="ubuntu"
+DEFAULT_PORT=5544
+DEFAULT_AUTH="password"
+NETWORK_PREFIX="192.168.44"
+OUTPUT=""
+CHECK=false
+DRY_RUN=false
+
+# Load ccr config if it exists
+if [ -f "$CCR_CONFIG" ]; then
+    while IFS='=' read -r key value; do
+        [[ "$key" =~ ^#.*$ || -z "$key" ]] && continue
+        key=$(echo "$key" | xargs)
+        value=$(echo "$value" | xargs)
+        value="${value/#\~/$HOME}"
+        case "$key" in
+            vm_user)      DEFAULT_USER="$value" ;;
+            vm_password)  DEFAULT_PASSWORD="$value" ;;
+            vm_ssh_port)  DEFAULT_PORT="$value" ;;
+            vm_inventory) OUTPUT="$value" ;;
+        esac
+    done < "$CCR_CONFIG"
+fi
+
+# Parse args
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --check)    CHECK=true; shift ;;
+        --dry-run)  DRY_RUN=true; shift ;;
+        --output)   OUTPUT="$2"; shift 2 ;;
+        --network)  NETWORK_PREFIX="$2"; shift 2 ;;
+        --help|-h)
+            echo "Usage: ccr-setup [--check] [--dry-run] [--output path] [--network prefix]"
+            echo ""
+            echo "Discovers LXC containers and generates vm-inventory.yaml"
+            echo ""
+            echo "Options:"
+            echo "  --check      Test SSH connectivity and claude installation per VM"
+            echo "  --dry-run    Show what would be generated without writing"
+            echo "  --output     Path for vm-inventory.yaml (default: from ~/.ccr or ~/vm-inventory.yaml)"
+            echo "  --network    Network prefix to filter (default: 192.168.44)"
+            exit 0
+            ;;
+        *) echo "Unknown option: $1"; exit 1 ;;
+    esac
+done
+
+[ -z "$OUTPUT" ] && OUTPUT="$HOME/vm-inventory.yaml"
+
+# Check lxc is available
+if ! command -v lxc >/dev/null 2>&1; then
+    echo "Error: 'lxc' command not found. This script runs on the LXC host."
+    exit 1
+fi
+
+echo "Discovering LXC containers on ${NETWORK_PREFIX}.0/24..."
+echo ""
+
+# Discover containers with matching IPs
+declare -A VM_IPS
+declare -A VM_STATUS
+
+while IFS=$'\t' read -r name status ip; do
+    [ -z "$name" ] && continue
+    # Strip lxc- prefix for the VM name
+    short_name="${name#lxc-}"
+    VM_IPS["$short_name"]="$ip"
+    VM_STATUS["$short_name"]="$status"
+done < <(lxc list --format json 2>/dev/null | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for c in data:
+    name = c['name']
+    status = c['status']
+    net = (c.get('state') or {}).get('network') or {}
+    ip = ''
+    for iface, info in net.items():
+        for a in info.get('addresses', []):
+            if a['family'] == 'inet' and a['address'].startswith('${NETWORK_PREFIX}'):
+                ip = a['address']
+    if ip:
+        print(f'{name}\t{status}\t{ip}')
+" 2>/dev/null)
+
+if [ ${#VM_IPS[@]} -eq 0 ]; then
+    echo "No containers found on ${NETWORK_PREFIX}.0/24"
+    exit 1
+fi
+
+# Sort VM names
+SORTED_VMS=($(echo "${!VM_IPS[@]}" | tr ' ' '\n' | sort))
+
+echo "Found ${#SORTED_VMS[@]} containers:"
+echo ""
+printf "  %-22s %-18s %s\n" "NAME" "IP" "STATUS"
+printf "  %-22s %-18s %s\n" "----" "--" "------"
+for vm in "${SORTED_VMS[@]}"; do
+    printf "  %-22s %-18s %s\n" "$vm" "${VM_IPS[$vm]}" "${VM_STATUS[$vm]}"
+done
+echo ""
+
+# Check SSH and claude if requested
+if [ "$CHECK" = true ]; then
+    echo "Checking SSH connectivity and claude installation..."
+    echo ""
+    printf "  %-22s %-8s %-8s %s\n" "NAME" "SSH" "CLAUDE" "VERSION"
+    printf "  %-22s %-8s %-8s %s\n" "----" "---" "------" "-------"
+    for vm in "${SORTED_VMS[@]}"; do
+        ip="${VM_IPS[$vm]}"
+        status="${VM_STATUS[$vm]}"
+        if [ "$status" != "Running" ]; then
+            printf "  %-22s %-8s %-8s %s\n" "$vm" "skip" "skip" "(not running)"
+            continue
+        fi
+        # Test SSH
+        ssh_ok="no"
+        claude_ver=""
+        if sshpass -p "$DEFAULT_PASSWORD" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -p "$DEFAULT_PORT" "${DEFAULT_USER}@${ip}" "true" 2>/dev/null; then
+            ssh_ok="ok"
+            # Check claude
+            claude_ver=$(sshpass -p "$DEFAULT_PASSWORD" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -p "$DEFAULT_PORT" "${DEFAULT_USER}@${ip}" "export PATH=\$HOME/.npm-global/bin:\$HOME/.local/bin:\$PATH && claude --version 2>/dev/null" 2>/dev/null || echo "")
+        fi
+        claude_status="no"
+        [ -n "$claude_ver" ] && claude_status="ok"
+        printf "  %-22s %-8s %-8s %s\n" "$vm" "$ssh_ok" "$claude_status" "$claude_ver"
+    done
+    echo ""
+fi
+
+# Generate inventory YAML
+INVENTORY="# VM Inventory - Generated by ccr-setup
+# Host: $(hostname)
+# Date: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+# Containers discovered via: lxc list
+
+defaults:
+  user: ${DEFAULT_USER}
+  auth: ${DEFAULT_AUTH}
+  password: ${DEFAULT_PASSWORD}
+  port: ${DEFAULT_PORT}
+  mount_root: /home/${DEFAULT_USER}
+  network: ${NETWORK_PREFIX}.0/24
+
+vms:"
+
+for vm in "${SORTED_VMS[@]}"; do
+    ip="${VM_IPS[$vm]}"
+    status="${VM_STATUS[$vm]}"
+    INVENTORY="${INVENTORY}
+  ${vm}:
+    ip: ${ip}
+    status: ${status,,}"
+done
+
+if [ "$DRY_RUN" = true ]; then
+    echo "--- Generated inventory (dry run) ---"
+    echo "$INVENTORY"
+    echo ""
+    echo "Would write to: $OUTPUT"
+else
+    # Backup existing
+    if [ -f "$OUTPUT" ]; then
+        cp "$OUTPUT" "${OUTPUT}.bak"
+        echo "Backed up existing inventory to ${OUTPUT}.bak"
+    fi
+    echo "$INVENTORY" > "$OUTPUT"
+    echo "Inventory written to: $OUTPUT"
+    echo "  ${#SORTED_VMS[@]} VMs registered"
+fi

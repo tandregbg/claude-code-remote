@@ -8,6 +8,10 @@ All notable changes to ccr.
 
 ### Added
 - **Multi-hub support** -- `--host user@ip` flag to connect to any hub from any machine
+- **`ccr-setup`** -- LXC container discovery script. Scans `lxc list`, generates `vm-inventory.yaml`
+  - `ccr-setup` -- discover and generate inventory
+  - `ccr-setup --check` -- also test SSH connectivity and claude installation per VM
+  - `ccr-setup --dry-run` -- preview without writing
 - **Linux compatibility** -- portable `sed -i` wrapper (`_sed_i`) for macOS and Linux
 - **VM inventory lookup** -- `hub add` now checks `vm-inventory.yaml` directly, not just tunnel ports
 
