@@ -4,6 +4,20 @@ All notable changes to ccr.
 
 ---
 
+## v0.9.5 -- 2026-04-19
+
+### Added
+- **Multi-hub support** -- `--host user@ip` flag to connect to any hub from any machine
+- **Linux compatibility** -- portable `sed -i` wrapper (`_sed_i`) for macOS and Linux
+- **VM inventory lookup** -- `hub add` now checks `vm-inventory.yaml` directly, not just tunnel ports
+
+### Fixed
+- `_sed_i` recursive call bug (infinite recursion on macOS)
+- `~` in config values (e.g. `vm_inventory=~/path`) now expands correctly
+- VM verification in `hub add` works on machines without tunnel-relay.sh
+
+---
+
 ## v0.9.3 -- 2026-04-18
 
 ### Added

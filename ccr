@@ -15,19 +15,29 @@
 #   ccr hub <tag>                 # Open saved tag in hub
 #   ccr hub add <vm>              # Add VM interactively (discover dirs, pick tag)
 #   ccr hub add <vm> -t tag -d /path  # Add VM with explicit tag and dir
-#   ccr hub add local             # Add a Mac Studio shell session
-#   ccr hub add local -t ops -d ~/Projects/my-project
+#   ccr hub add local             # Add a local shell session on the hub machine
+#   ccr hub add local -t ops -d ~/workspace
 #   ccr hub list                  # Show hub windows and registered tags
 #   ccr hub refresh               # Reconnect dead windows
 #   ccr hub remove <tag>          # Remove a saved tag
+#   ccr hub --host user@ip        # Connect to a different hub
 #
 # Roles:
-#   relay  — runs on the tmux host (Mac Studio), connects directly to tunnels
+#   relay  — runs on the hub machine, connects directly to VMs
 #   remote — runs on laptop/other, hops through relay host via ProxyJump
 #
 # Only needs two files on any machine: ~/bin/ccr + ~/.ccr
 
 set -euo pipefail
+
+# Portable sed -i (macOS needs '', Linux does not)
+_sed_i() {
+    if [[ "$OSTYPE" == darwin* ]]; then
+        sed -i '' "$@"
+    else
+        sed -i "$@"
+    fi
+}
 
 # Ensure homebrew and ~/bin are in PATH (non-interactive SSH has minimal PATH)
 export PATH="$HOME/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
@@ -53,6 +63,7 @@ if [ -f "$CONFIG" ]; then
         [[ "$key" =~ ^#.*$ || -z "$key" ]] && continue
         key=$(echo "$key" | xargs)
         value=$(echo "$value" | xargs)
+        value="${value/#\~/$HOME}"
         case "$key" in
             role)           ROLE="$value" ;;
             relay_host)     RELAY_HOST="$value" ;;
@@ -67,6 +78,25 @@ if [ -f "$CONFIG" ]; then
         esac
     done < "$CONFIG"
 fi
+
+# Parse global --host flag (must come before subcommand)
+# ccr hub --host user@ip ... -> overrides relay_host, forces role=remote
+_new_args=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --host)
+            RELAY_HOST="$2"
+            RELAY_HOST_FALLBACK=""
+            ROLE="remote"
+            shift 2
+            ;;
+        *)
+            _new_args+=("$1")
+            shift
+            ;;
+    esac
+done
+set -- "${_new_args[@]+"${_new_args[@]}"}"
 
 # Validate remote config
 if [ "$ROLE" = "remote" ] && [ -z "$RELAY_HOST" ]; then
@@ -198,7 +228,7 @@ tag_save() {
     touch "$HUB_TAGS"
     # Remove existing entry for this tag
     if grep -q "^${tag}	" "$HUB_TAGS" 2>/dev/null; then
-        sed -i '' "/^${tag}	/d" "$HUB_TAGS"
+        _sed_i "/^${tag}	/d" "$HUB_TAGS"
     fi
     echo -e "${tag}\t${vm}\t${dir}\t${mode}" >> "$HUB_TAGS"
 }
@@ -220,7 +250,7 @@ tag_list() {
 tag_remove() {
     local tag="$1"
     if [ -f "$HUB_TAGS" ] && grep -q "^${tag}	" "$HUB_TAGS" 2>/dev/null; then
-        sed -i '' "/^${tag}	/d" "$HUB_TAGS"
+        _sed_i "/^${tag}	/d" "$HUB_TAGS"
         echo "Removed tag '$tag'."
     else
         echo "Tag '$tag' not found."
@@ -328,7 +358,7 @@ while true; do
 done
 SCRIPTEOF
 
-    sed -i '' \
+    _sed_i \
         -e "s|__TMUX_SESSION__|${tmux_session}|g" \
         -e "s|__DIR__|${dir}|g" \
         -e "s|__FLAGS__|${CLAUDE_FLAGS}|g" \
@@ -338,9 +368,9 @@ SCRIPTEOF
         "$script"
 
     if [ "$method" = "key" ]; then
-        sed -i '' "s|__SSH_CMD__|${ssh_bin}|" "$script"
+        _sed_i "s|__SSH_CMD__|${ssh_bin}|" "$script"
     else
-        sed -i '' "s|__SSH_CMD__|${sshpass_bin} -p ${VM_PASSWORD} ${ssh_bin}|" "$script"
+        _sed_i "s|__SSH_CMD__|${sshpass_bin} -p ${VM_PASSWORD} ${ssh_bin}|" "$script"
     fi
 
     chmod +x "$script"
@@ -449,10 +479,20 @@ hub_add_interactive() {
     if [ "$vm" = "local" ]; then
         is_local=true
     else
-        # Verify VM exists
-        local port
-        port=$(resolve_port "$vm")
-        if [ -z "$port" ]; then
+        # Verify VM exists -- check inventory first, then tunnel ports
+        local vm_exists=false
+        local inventory="${VM_INVENTORY:-$HOME/vm-inventory.yaml}"
+        if [ -f "$inventory" ] && command -v yq >/dev/null 2>&1; then
+            local check_ip
+            check_ip=$(yq ".vms.${vm}.ip" "$inventory" 2>/dev/null)
+            [ -n "$check_ip" ] && [ "$check_ip" != "null" ] && vm_exists=true
+        fi
+        if [ "$vm_exists" = false ]; then
+            local port
+            port=$(resolve_port "$vm")
+            [ -n "$port" ] && vm_exists=true
+        fi
+        if [ "$vm_exists" = false ]; then
             echo "Error: Unknown VM '$vm'"
             return 1
         fi
@@ -787,14 +827,15 @@ if [ -z "${1:-}" ]; then
     echo "  ccr mindtastic -n bugfix   # Named session"
     echo ""
     echo "Hub (resilient multi-session):"
-    echo "  ccr hub                    # Attach to hub on Mac Studio"
-    echo "  ccr hub add heybarbro      # Add VM (discover dirs, pick tag)"
-    echo "  ccr hub add sonetel -t api -d ~/src/api"
-    echo "  ccr hub add local -t ops   # Mac Studio shell"
-    echo "  ccr hub hej-barbro         # Open saved tag"
+    echo "  ccr hub                    # Attach to hub"
+    echo "  ccr hub add <vm>           # Add VM (discover dirs, pick tag)"
+    echo "  ccr hub add <vm> -t tag -d ~/src/project"
+    echo "  ccr hub add local -t ops   # Local shell on hub machine"
+    echo "  ccr hub <tag>              # Open saved tag"
     echo "  ccr hub list               # Show windows and tags"
     echo "  ccr hub refresh            # Reconnect dead windows"
     echo "  ccr hub remove <tag>       # Remove a saved tag"
+    echo "  ccr hub --host user@ip     # Connect to a different hub"
     exit 0
 fi
 
