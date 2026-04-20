@@ -4,6 +4,17 @@ All notable changes to ccr.
 
 ---
 
+## v0.9.6 -- 2026-04-20
+
+### Added
+- **Tailscale host support** -- hub now resolves VMs from both `vms:` and `tailscale:` sections in inventory
+- Tailscale hosts default to port 22 and key auth
+
+### Fixed
+- `~` path in `-d` flag for remote VMs was expanding on the hub machine instead of the target VM
+
+---
+
 ## v0.9.5 -- 2026-04-19
 
 ### Added

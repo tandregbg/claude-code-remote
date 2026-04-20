@@ -299,18 +299,30 @@ LOCALEOF
         local inventory="${VM_INVENTORY:-$HOME/vm-inventory.yaml}"
         local vm_ip="" vm_port="" vm_user="" vm_auth=""
         if [ -f "$inventory" ] && command -v yq >/dev/null 2>&1; then
+            # Check vms section first, then tailscale
+            local inv_section="vms"
             vm_ip=$(yq ".vms.${vm}.ip" "$inventory" 2>/dev/null)
+            if [ -z "$vm_ip" ] || [ "$vm_ip" = "null" ]; then
+                vm_ip=$(yq ".tailscale.${vm}.ip" "$inventory" 2>/dev/null)
+                [ -n "$vm_ip" ] && [ "$vm_ip" != "null" ] && inv_section="tailscale"
+            fi
             [ "$vm_ip" = "null" ] && vm_ip=""
-            vm_port=$(yq ".vms.${vm}.port" "$inventory" 2>/dev/null)
+            vm_port=$(yq ".${inv_section}.${vm}.port" "$inventory" 2>/dev/null)
             [ "$vm_port" = "null" ] && vm_port=""
-            vm_user=$(yq ".vms.${vm}.user" "$inventory" 2>/dev/null)
+            vm_user=$(yq ".${inv_section}.${vm}.user" "$inventory" 2>/dev/null)
             [ "$vm_user" = "null" ] && vm_user=""
-            vm_auth=$(yq ".vms.${vm}.auth" "$inventory" 2>/dev/null)
+            vm_auth=$(yq ".${inv_section}.${vm}.auth" "$inventory" 2>/dev/null)
             [ "$vm_auth" = "null" ] && vm_auth=""
         fi
         if [ -n "$vm_ip" ]; then
             ssh_host="$vm_ip"
-            ssh_port="${vm_port:-$SSH_PORT}"
+            # Tailscale hosts default to port 22, VMs to SSH_PORT
+            local default_port="$SSH_PORT"
+            [ "$inv_section" = "tailscale" ] && default_port=22
+            ssh_port="${vm_port:-$default_port}"
+            # Tailscale hosts default to key auth
+            [ "$inv_section" = "tailscale" ] && [ -z "$vm_auth" ] && vm_auth="key"
+            [ "$inv_section" = "tailscale" ] && [ -z "$vm_user" ] && vm_user="tomas"
         else
             ssh_port=$(resolve_port "$vm")
             ssh_host="localhost"
@@ -485,6 +497,7 @@ hub_add_interactive() {
         if [ -f "$inventory" ] && command -v yq >/dev/null 2>&1; then
             local check_ip
             check_ip=$(yq ".vms.${vm}.ip" "$inventory" 2>/dev/null)
+            [ -z "$check_ip" ] || [ "$check_ip" = "null" ] && check_ip=$(yq ".tailscale.${vm}.ip" "$inventory" 2>/dev/null)
             [ -n "$check_ip" ] && [ "$check_ip" != "null" ] && vm_exists=true
         fi
         if [ "$vm_exists" = false ]; then
