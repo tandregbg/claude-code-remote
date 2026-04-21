@@ -176,7 +176,29 @@ Tags persist across reboots. When `ccr hub` creates a new hub session, it auto-r
 | `Ctrl+b, <number>` | Switch to window N |
 | `Ctrl+b, n` / `Ctrl+b, p` | Next / previous window |
 | `Ctrl+b, d` | Detach from hub (all sessions keep running) |
+| `Ctrl+b, .` | Renumber current window |
+| `Ctrl+b, :` | tmux command prompt |
 | `Ctrl+a, ...` | Inner VM tmux commands (nested sessions) |
+
+### Rearranging windows
+
+```
+Ctrl+b, :    then    swap-window -t 0          # move current to position 0
+Ctrl+b, :    then    swap-window -s 3 -t 1     # swap window 3 and 1
+Ctrl+b, .                                      # renumber current window
+```
+
+### Mouse support
+
+Mouse scrolling is auto-enabled on both hub and inner VM tmux sessions. If it stops working after a reconnect:
+
+```
+# Hub level:
+Ctrl+b, :    then    set -g mouse on
+
+# VM level:
+Ctrl+a, :    then    set -g mouse on
+```
 
 ## After a disconnect
 

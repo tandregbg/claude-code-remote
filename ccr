@@ -358,7 +358,7 @@ export PATH="$HOME/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 unset TMUX
 SSH_OPTS="-tt -o StrictHostKeyChecking=no -o ServerAliveInterval=15 -o ServerAliveCountMax=6 -o TCPKeepAlive=yes"
 INNER='cd __DIR__ && export PATH=$HOME/.npm-global/bin:$HOME/.local/bin:$PATH && claude __FLAGS__'
-REMOTE="if tmux has-session -t __TMUX_SESSION__ 2>/dev/null; then tmux attach -t __TMUX_SESSION__; else tmux new-session -s __TMUX_SESSION__ '$INNER'; fi"
+REMOTE="tmux set -g mouse on 2>/dev/null; if tmux has-session -t __TMUX_SESSION__ 2>/dev/null; then tmux attach -t __TMUX_SESSION__; else tmux new-session -s __TMUX_SESSION__ '$INNER'; fi"
 
 # Retry loop -- keeps window alive on failure so it can be diagnosed/refreshed
 while true; do
@@ -751,6 +751,7 @@ if [ "${1:-}" = "hub" ]; then
         remove)    tag_remove "$1" ;;
         attach)
             hub_ensure
+            tmux set-option -t "$HUB_SESSION" mouse on 2>/dev/null
             exec tmux attach -t "$HUB_SESSION"
             ;;
         add)

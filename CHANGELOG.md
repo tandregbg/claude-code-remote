@@ -4,6 +4,14 @@ All notable changes to ccr.
 
 ---
 
+## v0.9.7 -- 2026-04-21
+
+### Added
+- **Auto mouse support** -- mouse scrolling enabled on both hub and inner VM tmux sessions on every connect/attach
+- Window management documented (swap, renumber, rearrange)
+
+---
+
 ## v0.9.6 -- 2026-04-20
 
 ### Added
