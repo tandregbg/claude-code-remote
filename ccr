@@ -152,7 +152,7 @@ get_vms() {
     fi
 
     # Fallback: parse local SSH config
-    awk '/^Host relay_[^*]/{name=$2; sub(/^relay_/,"",name); getline; getline; port=$2; printf "  %-18s localhost:%s\n", name, port}' ~/.ssh/config 2>/dev/null
+    awk '/^Host relay[-_][^*]/{name=$2; sub(/^relay[-_]/,"",name); getline; getline; port=$2; printf "  %-18s localhost:%s\n", name, port}' ~/.ssh/config 2>/dev/null
 }
 
 # Resolve host port
@@ -161,7 +161,8 @@ resolve_port() {
 
     # 1. Try local SSH config
     local port
-    port=$(awk -v host="Host relay_${host}" '$0 == host {found=1; next} found && /Port /{print $2; exit}' ~/.ssh/config 2>/dev/null)
+    # Try both relay- (new) and relay_ (legacy) prefix
+    port=$(awk -v h1="Host relay-${host}" -v h2="Host relay_${host}" '($0 == h1 || $0 == h2) {found=1; next} found && /Port /{print $2; exit}' ~/.ssh/config 2>/dev/null)
     [ -n "$port" ] && echo "$port" && return
 
     # 2. Try local tunnel-relay.sh
@@ -185,9 +186,9 @@ resolve_port() {
 resolve_host_auth() {
     local host="$1"
 
-    # Check SSH config for User on relay_<host>
+    # Check SSH config for User on relay-<host> (or legacy relay_<host>)
     local user
-    user=$(awk -v h="Host relay_${host}" '$0 == h {found=1; next} found && /User /{print $2; exit}' ~/.ssh/config 2>/dev/null)
+    user=$(awk -v h1="Host relay-${host}" -v h2="Host relay_${host}" '($0 == h1 || $0 == h2) {found=1; next} found && /User /{print $2; exit}' ~/.ssh/config 2>/dev/null)
 
     if [ -n "$user" ] && [ "$user" != "ubuntu" ]; then
         # Non-default user = likely key auth (Tailscale host)
@@ -224,13 +225,13 @@ tag_lookup() {
 }
 
 tag_save() {
-    local tag="$1" vm="$2" dir="$3" mode="${4:-claude}"
+    local tag="$1" vm="$2" dir="$3" mode="${4:-claude}" color="${5:-}"
     touch "$HUB_TAGS"
     # Remove existing entry for this tag
     if grep -q "^${tag}	" "$HUB_TAGS" 2>/dev/null; then
         _sed_i "/^${tag}	/d" "$HUB_TAGS"
     fi
-    echo -e "${tag}\t${vm}\t${dir}\t${mode}" >> "$HUB_TAGS"
+    echo -e "${tag}\t${vm}\t${dir}\t${mode}\t${color}" >> "$HUB_TAGS"
 }
 
 tag_list() {
@@ -239,11 +240,12 @@ tag_list() {
         return
     fi
     echo "Registered tags:"
-    printf "  %-20s %-18s %-30s %s\n" "TAG" "VM" "DIRECTORY" "MODE"
-    printf "  %-20s %-18s %-30s %s\n" "---" "--" "---------" "----"
-    while IFS=$'\t' read -r tag vm dir mode; do
+    printf "  %-20s %-18s %-30s %-8s %s\n" "TAG" "VM" "DIRECTORY" "MODE" "COLOR"
+    printf "  %-20s %-18s %-30s %-8s %s\n" "---" "--" "---------" "----" "-----"
+    while IFS=$'\t' read -r tag vm dir mode color; do
         mode="${mode:-claude}"
-        printf "  %-20s %-18s %-30s %s\n" "$tag" "$vm" "$dir" "$mode"
+        color="${color:-auto}"
+        printf "  %-20s %-18s %-30s %-8s %s\n" "$tag" "$vm" "$dir" "$mode" "$color"
     done < "$HUB_TAGS"
 }
 
@@ -299,12 +301,16 @@ LOCALEOF
         local inventory="${VM_INVENTORY:-$HOME/vm-inventory.yaml}"
         local vm_ip="" vm_port="" vm_user="" vm_auth=""
         if [ -f "$inventory" ] && command -v yq >/dev/null 2>&1; then
-            # Check vms section first, then tailscale
+            # Check vms, then tailscale, then wireguard
             local inv_section="vms"
             vm_ip=$(yq ".vms.${vm}.ip" "$inventory" 2>/dev/null)
             if [ -z "$vm_ip" ] || [ "$vm_ip" = "null" ]; then
                 vm_ip=$(yq ".tailscale.${vm}.ip" "$inventory" 2>/dev/null)
                 [ -n "$vm_ip" ] && [ "$vm_ip" != "null" ] && inv_section="tailscale"
+            fi
+            if [ -z "$vm_ip" ] || [ "$vm_ip" = "null" ]; then
+                vm_ip=$(yq ".wireguard.${vm}.ip" "$inventory" 2>/dev/null)
+                [ -n "$vm_ip" ] && [ "$vm_ip" != "null" ] && inv_section="wireguard"
             fi
             [ "$vm_ip" = "null" ] && vm_ip=""
             vm_port=$(yq ".${inv_section}.${vm}.port" "$inventory" 2>/dev/null)
@@ -316,13 +322,13 @@ LOCALEOF
         fi
         if [ -n "$vm_ip" ]; then
             ssh_host="$vm_ip"
-            # Tailscale hosts default to port 22, VMs to SSH_PORT
+            # VMs default to SSH_PORT, tailscale/wireguard default to 22
             local default_port="$SSH_PORT"
-            [ "$inv_section" = "tailscale" ] && default_port=22
+            [ "$inv_section" != "vms" ] && default_port=22
             ssh_port="${vm_port:-$default_port}"
-            # Tailscale hosts default to key auth
-            [ "$inv_section" = "tailscale" ] && [ -z "$vm_auth" ] && vm_auth="key"
-            [ "$inv_section" = "tailscale" ] && [ -z "$vm_user" ] && vm_user="tomas"
+            # Non-VM hosts default to key auth
+            [ "$inv_section" != "vms" ] && [ -z "$vm_auth" ] && vm_auth="key"
+            [ "$inv_section" != "vms" ] && [ -z "$vm_user" ] && vm_user="tomas"
         else
             ssh_port=$(resolve_port "$vm")
             ssh_host="localhost"
@@ -401,10 +407,20 @@ hub_apply_style() {
     tmux set-option -t "$HUB_SESSION" status-right "#[fg=white] %H:%M " 2>/dev/null
     tmux set-option -t "$HUB_SESSION" mouse on 2>/dev/null
 
-    # Color each window based on its index
+    # Color each window -- use per-tag color if set, else cycle through palette
     local i=0
     while IFS=$'\t' read -r win_idx win_name; do
-        local color="${HUB_COLORS[$((i % ${#HUB_COLORS[@]}))]}"
+        # Look up tag color from registry
+        local color=""
+        if [ -f "$HUB_TAGS" ]; then
+            local tag_entry
+            tag_entry=$(grep -m1 "^${win_name}	" "$HUB_TAGS" 2>/dev/null || true)
+            if [ -n "$tag_entry" ]; then
+                color=$(echo "$tag_entry" | cut -f5)
+            fi
+        fi
+        # Fall back to palette rotation if no color set
+        [ -z "$color" ] && color="${HUB_COLORS[$((i % ${#HUB_COLORS[@]}))]}"
         tmux set-window-option -t "${HUB_SESSION}:${win_idx}" window-status-format \
             " #[fg=${color}]#I:#W " 2>/dev/null
         tmux set-window-option -t "${HUB_SESSION}:${win_idx}" window-status-current-format \
@@ -485,6 +501,7 @@ hub_add_interactive() {
     local explicit_tag="${2:-}"
     local explicit_dir="${3:-}"
     local explicit_mode="${4:-}"
+    local explicit_color="${5:-}"
     local is_local=false
 
     # "local" means a shell on Mac Studio itself
@@ -496,9 +513,11 @@ hub_add_interactive() {
         local inventory="${VM_INVENTORY:-$HOME/vm-inventory.yaml}"
         if [ -f "$inventory" ] && command -v yq >/dev/null 2>&1; then
             local check_ip
-            check_ip=$(yq ".vms.${vm}.ip" "$inventory" 2>/dev/null)
-            [ -z "$check_ip" ] || [ "$check_ip" = "null" ] && check_ip=$(yq ".tailscale.${vm}.ip" "$inventory" 2>/dev/null)
-            [ -n "$check_ip" ] && [ "$check_ip" != "null" ] && vm_exists=true
+            local check_ip
+            for section in vms tailscale wireguard; do
+                check_ip=$(yq ".${section}.${vm}.ip" "$inventory" 2>/dev/null)
+                [ -n "$check_ip" ] && [ "$check_ip" != "null" ] && vm_exists=true && break
+            done
         fi
         if [ "$vm_exists" = false ]; then
             local port
@@ -597,10 +616,17 @@ hub_add_interactive() {
         mode="${mode:-claude}"
     fi
 
+    # For remote VMs, convert expanded $HOME back to ~ so the path
+    # is correct on the target machine, not the hub
+    local save_dir="$dir"
+    if [ "$is_local" = false ]; then
+        save_dir="${save_dir/#$HOME/\~}"
+    fi
+
     # Save to registry
-    tag_save "$tag" "$vm" "$dir" "$mode"
+    tag_save "$tag" "$vm" "$save_dir" "$mode" "$explicit_color"
     echo ""
-    echo "Saved: $tag -> $vm:$dir ($mode)"
+    echo "Saved: $tag -> $vm:$save_dir ($mode)"
 
     # Open in hub
     hub_open_tag "$tag"
@@ -732,6 +758,7 @@ if [ "${1:-}" = "hub" ]; then
                             local_flags="$local_flags -d $dir_arg"
                             shift 2 ;;
                         -m) local_flags="$local_flags -m $2"; shift 2 ;;
+                        -c) local_flags="$local_flags -c $2"; shift 2 ;;
                         *) shift ;;
                     esac
                 done
@@ -758,16 +785,17 @@ if [ "${1:-}" = "hub" ]; then
             # Parse -t tag -d dir flags
             local_vm="$1"; shift 2>/dev/null || true
             add_tag="" ; add_dir=""
-            add_mode=""
+            add_mode="" ; add_color=""
             while [ $# -gt 0 ]; do
                 case "$1" in
                     -t) add_tag="$2"; shift 2 ;;
                     -d) add_dir="$2"; shift 2 ;;
                     -m) add_mode="$2"; shift 2 ;;
+                    -c) add_color="$2"; shift 2 ;;
                     *) shift ;;
                 esac
             done
-            hub_add_interactive "$local_vm" "$add_tag" "$add_dir" "$add_mode"
+            hub_add_interactive "$local_vm" "$add_tag" "$add_dir" "$add_mode" "$add_color"
             ;;
         open)
             hub_open_tag "${subcmd_arg}"

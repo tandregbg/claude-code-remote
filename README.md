@@ -106,14 +106,21 @@ vms:
     ip: 10.0.1.100
   my-web-vm:
     ip: 10.0.1.101
-  special-vm:
-    ip: 10.0.1.200
+
+tailscale:
+  my-remote-server:
+    ip: 100.x.x.x
+    user: admin
+
+wireguard:
+  my-blade:
+    ip: 172.16.x.x
     user: admin
     port: 22
     auth: key
 ```
 
-Per-VM overrides for `user`, `port`, and `auth` (key/password) are supported.
+Three host sections are supported: `vms`, `tailscale`, and `wireguard`. Per-host overrides for `user`, `port`, and `auth` (key/password) work in all sections. Non-VM hosts (tailscale, wireguard) default to port 22 and key auth.
 
 ## Usage
 
@@ -144,6 +151,9 @@ ccr hub add <vm>
 # Explicit
 ccr hub add <vm> -t my-tag -d ~/src/project
 
+# With color
+ccr hub add <vm> -t my-tag -d ~/src/project -c cyan
+
 # Local hub machine session
 ccr hub add local -t ops -d ~/workspace
 ccr hub add local -t shell-only -d ~/workspace -m shell
@@ -157,14 +167,16 @@ ccr hub remove <tag>
 Tags are saved in `~/.ccr-tags` on the hub machine:
 
 ```
-# tag          vm          directory              mode
+# tag          vm          directory              mode     color
 project-a      my-dev-vm   ~/src/project-a        claude
 ops            local       ~/workspace            shell
 goals          local       ~/documents/goals      claude
+frontend       my-web-vm   ~/src/app              claude   cyan
 ```
 
 - **mode `claude`** (default): starts Claude Code with configured flags
 - **mode `shell`**: opens a plain shell
+- **color** (optional): persistent tmux status bar color. Available: green, yellow, blue, magenta, cyan, red, white. Omit for auto-rotation.
 
 Tags persist across reboots. When `ccr hub` creates a new hub session, it auto-restores all saved tags.
 

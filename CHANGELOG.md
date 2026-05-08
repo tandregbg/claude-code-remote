@@ -4,6 +4,23 @@ All notable changes to ccr.
 
 ---
 
+## v0.10.0 -- 2026-05-08
+
+### Added
+- **WireGuard host support** -- inventory lookup now checks `vms:`, `tailscale:`, and `wireguard:` sections
+- **Per-tag colors** -- `ccr hub add <vm> -t tag -c cyan` sets a persistent color for the tag in the status bar. Available colors: green, yellow, blue, magenta, cyan, red, white. Tags without a color auto-cycle through the palette.
+- **`--host` override in all hub subcommands** -- `ccr hub list --host user@ip` works for add, refresh, remove, etc.
+
+### Changed
+- **SSH config prefix** -- now matches both `relay-` (new convention) and `relay_` (legacy) when looking up ports and users
+- Non-VM hosts (tailscale + wireguard) default to port 22 and key auth (previously only tailscale did)
+
+### Fixed
+- **Remote VM path expansion** -- `~` in `-d` flag for remote VMs no longer expands to the hub machine's `$HOME`. Paths are stored correctly for the target VM.
+- **`doable-server` tag** updated to reference `doable-proxy` (WireGuard peer) after VM decommission
+
+---
+
 ## v0.9.7 -- 2026-04-21
 
 ### Added
